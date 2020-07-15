@@ -1,0 +1,469 @@
+"""
+A module to scrape historical weather data for a user-specified time range
+from Weather Underground for a user-specified weather station.
+"""
+
+
+
+###
+### IMPORT REQUIRED MODULES.
+###
+
+# Handle calculations related to the date range to be sampled.
+import time
+from calendar import timegm
+
+# Access dynamic content on Weather Underground.
+from selenium import webdriver
+
+# Parsing the response.
+from bs4 import BeautifulSoup
+
+# Regex-driven cleaning of data headers to ensure SQL compatibility.
+import re
+
+# Write the scraped data to a SQL database.
+import dataset
+
+
+
+###
+### DEFINE FUNCTIONS.
+###
+
+def parse_date_str(date_str):
+
+    """
+    This function accepts a date as a string in the format YYY-MM-DD and
+    returns the corresponding epoch time.
+
+    It is called to interpret user-specified start and end dates for the
+    data scraping range.
+    """
+
+    parsed_time = time.strptime(date_str, "%Y-%m-%d")
+    epoch_time = timegm(parsed_time)
+    return epoch_time
+
+
+
+def epoch_to_str(epoch_time):
+
+    """
+    This function converts an epoch time back into separate strings for year,
+    month, and the day of month.
+
+    It is called while iterating between start_time and end_time in order to
+    generate dates as strings that can be included in a the Weather Underground
+    URL.
+    """
+
+    # First, convert the input epoch time into a struct_time
+    struct_date = time.gmtime(epoch_time)
+
+    # Then grab the year, month, and day of month as strings.
+    year = str(struct_date.tm_year)
+    month = str(struct_date.tm_mon)
+    day = str(struct_date.tm_mday)
+
+    # Finally, return the strings as elements of a list.
+    return [year, month, day]
+
+
+
+def parse_wu_page(source):
+
+    """
+    This function accepts the source of a single Weather Underground page
+    obtained from Selenium.
+
+    It is called once for each page that needs to be parsed. Equivalently, it is
+    called once for each date in the scraping range, as each page displays
+    weather data for a single date.
+
+    It calls a number of other helper functions:
+         - clean_column_labels(): generates informative column labels, which
+           will ultimately be passed to the SQL database
+         - parse_row(): parses a single, data-containing (non-header) row of
+           weather information.
+
+    The function returns a list of dicts, daily_data, in which each list is a
+    dict that contains weather data for a single hour. The list of dicts is
+    ready to be written to the SQL database.
+
+    Note that daily_data does NOT include the date that corresponds to the
+    weather data -- only the time. The date is added independently after
+    executing parse_wu_page() and before writing results to the SQL database.
+    """
+
+    # Pass the page source obtained from Selenium to instantiate the Soup.
+
+    soup = BeautifulSoup(source, "html.parser")
+
+    # Extract the hourly data, which is stored in a table with the class
+    # "mat-table". The table of interest is the only table of this class.
+
+    hourly_table = soup.find("table", class_ = "mat-table")
+
+    # Extract the raw table headers from hourly_table. These headers will
+    # later be refined to ensure SQL compatibility.
+    # Table headers are contained in a row with the class "mat-header-row".
+    # Within the header row, the headers are listed as buttons with the class
+    # "mat-sort-header-button".
+
+    table_header = hourly_table.find("tr", class_ = "mat-header-row")
+    raw_header_list = [header.text for header in table_header.find_all(
+                        "button", class_ = "mat-sort-header-button")
+                      ]
+
+    # Next, parse the table down to individual rows.
+
+    table_body = hourly_table.find("tbody")
+    data_rows = table_body.find_all("tr")
+
+    # Pass raw_header_list and the first data row (data_rows[0])
+    # the to clean_column_labels function in order to generate well formatted
+    # headers.
+    # The first data row is necessary here because it includes units (such as F
+    # or mph) that are not included in raw_header_list.
+
+    cleaned_header_labels = clean_column_labels(raw_header_list, data_rows[0])
+
+    # The day's data will be appended to a list of dicts, daily_data.
+    daily_data = []
+
+    # Iterate over each data-containing (non-header) row in the table.
+    # Parse the weather data from the table, returning a dict of data for each
+    # hour on the table (new_hour_data).
+    # Append it to the growing list of information from this Weather Underground
+    # page.
+
+    for hour in data_rows:
+        new_hour_data = parse_row(hour, cleaned_header_labels)
+        daily_data.append(new_hour_data)
+
+    return daily_data
+
+
+
+def clean_column_labels(raw_headers, first_data_row):
+
+    """
+    This function is used to generate clearly named columns, which will
+    ultimately become the column names in the SQL database.
+
+    It accepts the following arguments:
+        - raw_headers, a list generated by the parse_wu_page() function during
+          the initial parsing of the data table.
+        - first_data_row, the first row of actual data, which also contains
+          relevant units, such as "F", "mph", or "%".
+
+    It returns a single list, clean_headers, for which the label from the
+    raw (original) headers list has been appended with a unit of measure from
+    the units list where appropriate. That is: a raw_header of "Time" remains
+    as "Time", but "Wind Speed" becomes "Wind_Speed_mph", for example.
+    """
+
+    # First, extract any measurement units that are present in first_data_row.
+    # This block of code is very similar to one present in parse_row, but
+    # stripped down.
+    # It is embedded in a TRY function because not all cells contain units to
+    # extract.
+
+    units_for_headers = []
+
+    for cell in first_data_row:
+        try:
+            # Cell content is divided between two span tags, but the "wu-label"
+            # class contains only the unit (no numerical data).
+            unit = cell.find("span", class_="wu-label").text
+            units_for_headers.append(unit)
+        except:
+            # The table includes a 'comment' cell, which contains no text.
+            # Without this try-except block, an AttributeError derails the
+            # FOR loop.
+            try:
+                units_for_headers.append("")
+            except AttributeError:
+                pass
+
+    # Next, create the list of modified column labels which also includes
+    # the units obtained by parsing the first row.
+
+    clean_headers = []
+    for i in range(0, len(raw_headers)):
+
+        # If units are present, append them to the raw_header entry. Otherwise,
+        # just use the raw_header entry.
+        if not (units_for_headers[i] == ""):
+            draft_header = raw_headers[i] + "_" + units_for_headers[i]
+        else:
+            draft_header = raw_headers[i]
+
+        # Replace any white spaces with underscores.
+        draft_header = re.sub(r"\s+", "_", draft_header)
+
+        # Also delete periods, commas, colons, and semicolons.
+        draft_header = re.sub(r"[\.\,\:\;]", "", draft_header)
+
+        # Finally, replace the percent sign (from relative humidity
+        # measurements) with "pct".
+        draft_header = re.sub(r"\%", "pct", draft_header)
+
+        # Append the cleaned header to the list.
+        clean_headers.append(draft_header)
+
+    return clean_headers
+
+
+
+def parse_row(row, clean_header_list):
+
+    """
+    This function accepts the following inputs:
+         - row, a single data row (as an unparsed Soup) from the parse_wu_page()
+           function.
+         - clean_header_list, a list of SQL-friendly data headers that will
+           ultimately become column names in the SQL table.
+
+    It is called by the parse_wu_page() function once for each data-containing
+    (i.e.: non-header) row in the data table.
+
+    It returns a dict, single_hour_data, for which contains Weather Underground
+    data for one hour:
+         - The keys are cleaned, informative labels, such as "Time" or "Wind
+           Speed (mph)".
+         - Their corresponding, unitless values.
+    """
+
+    # These two lists will be temporary placeholders for the scraped data:
+    #     - measurement_list, which contains all the measured values in the
+    #       data table. For example, "10".
+    #     - unit_list, which contains the corresponding units for each
+    #       measurement. For example, "mph".
+    #       This list is not used for any purpose currently, but it could
+    #       become helpful.
+
+    measurement_list = []
+    unit_list = []
+
+    # Parsing the row is made a bit complicated by the fact that a cell can
+    # include both a measurement and a unit, such as a wind speed measurement
+    # of "5 mph". We do not want to include the unit in the data output.
+    #
+    # Fortunately, cells that include both a measurement and unit separate
+    # them into unique span elements with different classes.
+    #
+    # However, unitless data (such as times and wind directions) do NOT include
+    # the same span tags, and therefore must be parsed in a different way.
+    # The TRY statement parses cells containing both measurements and units,
+    # while the EXCEPT block parses cells that do not contain units.
+
+    for cell in row:
+        try:
+            measurement = cell.find("span", class_="wu-value").text
+            measurement_list.append(measurement)
+            unit = cell.find("span", class_="wu-label").text
+            unit_list.append(unit)
+        except:
+            # The table contains a hidden 'comment' cell, with no text.
+            # Without this try-except block, an AttributeError is raised.
+            try:
+                measurement_list.append(cell.text)
+                unit_list.append("")
+            except AttributeError:
+                pass
+
+    # Ensure that the row was parsed correctly: the number of headers (from the
+    # table), measurements (from only this row), and units (also from only this
+    # row) should be equal.
+
+    if (
+        len(clean_header_list) == len(measurement_list)
+        and len(clean_header_list) == len(unit_list)
+        ):
+        pass
+    else:
+        raise Exception("""List length mismatch: table's clean_header_list ({}),
+            row's measurement_list ({}), and row's units_list ({}).""".format(
+            len(clean_header_list), len(measurement_list), len(unit_list)))
+
+    single_hour_data = {}
+    for header, value in zip(clean_header_list, measurement_list):
+        single_hour_data[header] = value
+
+    return single_hour_data
+
+
+
+def scrape():
+
+    """
+    This is the only user-callable function in wunderground_scraper.
+
+    It does not accept any arguments, but it will prompt the user for
+    necessary input.
+
+    Simple progress updates are printed to the screen, and a SQLite
+    database is saved to the hard drive.
+    """
+
+
+    ###
+    ### PROMPT THE USER FOR BASIC PARAMETERS.
+    ###
+
+
+    # Ask the user for a base URL to use in the query.
+    # This could be better done by asking for a location, then parsing it
+    # appropriately, but this will get the job done.
+
+    # The date (as string) will ultimately be appended to this
+    # root URL to give an address for one day worth of weather data.
+    # e.g. https://www.wunderground.com/history/daily/
+    #    us/ca/burbank/KBUR/date/2009-7-9 for July 9, 2009.
+
+    print(("\nPlease visit Weather Underground to identify a suitable location"
+            " with the\n"
+            "historical data of interest.\n"
+            "Having done so, paste the root portion of the URL below, ending "
+            "with \n"
+            "/date/. e.g.:\n"
+            "https://www.wunderground.com/history/daily/"
+            "us/ca/burbank/KBUR/date/"
+            ))
+
+    base_url = input("> ")
+
+    # Ask the user for the time range to scrape.
+
+    print("\nSpecify the START date for the query in the format of YYYY-MM-DD.")
+    raw_start_date = input("> ")
+
+    print("Specify the END date for the query in the format of YYYY-MM-DD.")
+    raw_end_date = input("> ")
+
+
+    # Ask the user what name to use for the SQL database & table.
+    print(("\nBy default, data will be saved to an SQLite database named\n"
+            "historical_weather.db in this directory.\n"
+            "Type a new path, or press 'enter' to use the default."
+            ))
+    db_path = input("> ")
+
+    print("Name of SQL table within this database?")
+    print("Pressing 'enter' will use the default name, scraped_data.")
+    table_name = input("> ")
+
+    ###
+    ### PREPARE CONNECTION TO THE SQL DATABASE USING DATASET.
+    ###
+
+    # Determine if the user will use the default DB path, or a custom one.
+    if db_path == "":
+        db_path = "historical_weather.db"
+    else:
+        pass
+
+    # Determine if the user will use the default table name or a custom one.
+    if table_name == "":
+        table_name = "scraped_data"
+    else:
+        pass
+
+    # Create the dataset object.
+
+    connect_to = "sqlite:///" + db_path
+    weather_db = dataset.connect(connect_to)
+
+    # Specify a table to update.
+    sql_table = weather_db[table_name]
+
+
+
+    ###
+    ### USE SELENIUM TO PREPARE A DRIVER FOR CHROME.
+    ###
+
+    # Establish settings prior to instatiating the Chrome driver.
+    # Use incognito mode & do not visually display Chrome.
+    custom_env = webdriver.ChromeOptions()
+    custom_env.add_argument('--incognito')
+    custom_env.add_argument('--headless')
+
+    # Instantiate the Chrome driver.
+    driver = webdriver.Chrome(options = custom_env)
+    print("\nOpening a hidden browser window.")
+    print("\tWaiting 5 seconds.")
+    time.sleep(5)
+    print("\tSuccess.\n\nNow scraping weather data:\n")
+
+
+    ###
+    ### SCRAPE OVER THE DESIRED DATE RANGE.
+    ###
+
+    # The number of seconds per day will be used as a step size in the
+    # subsequent FOR loop so that the loop execuetes once for each day of
+    # interest.
+    secs_per_day = 60 * 60 * 24
+
+    # Convert the string dates into seconds since epoch.
+    start_date_epoch_time = parse_date_str(raw_start_date)
+    end_date_epoch_time = parse_date_str(raw_end_date)
+
+    # Prepare basic stats about the scraping operation, which will later
+    # be printed while the FOR loop is running so users know it is working.
+    total_days = int((end_date_epoch_time - start_date_epoch_time) / secs_per_day)
+    day_counter = 0
+
+    # This string will be passed 3 variables and printed as a status message
+    # every time a new day's data is parsed. In order, the 3 variables are:
+    #     - day_as_string: show the date as, e.g., "2020-01-01"
+    #     - day_counter: How many days have been completed?
+    #     - total_days: How many total days are there to scrape?
+    status_message = "\tWorking on {}.\tCompleted: {} / {} days.".format
+
+    # Iterate over every day from start_time up to and including end_time in
+    # one-day steps.
+
+    for day_as_epoch_time in range(start_date_epoch_time,
+        end_date_epoch_time + secs_per_day, secs_per_day):
+
+        # Convert the epoch time into a date string in the format YYYY-MM-DD.
+        day_as_string = "-".join(epoch_to_str(day_as_epoch_time))
+
+        # Before doing anything else, update the status message:
+        print(status_message(day_as_string,
+                             day_counter,
+                             total_days), end = "\r")
+
+        # Assemble a query URL from the base Weather Underground URL and the
+        # formatted (YYYY-MM-DD) date.
+        query_url = base_url + day_as_string
+
+        # Use Selenium to access the page. Wait 1.5 seconds for the dynamic
+        # content to load (slowly...) before accessing the source html.
+        driver.get(query_url)
+        time.sleep(1.5)
+        source_html = driver.page_source
+
+        # Pass the source to parse_wu_page() to parse using Beautiful Soup.
+        # This returns a list of dicts with all the weather information for the
+        # given day_as_epoch_time. Each dict is data from a single hour.
+        # Note that parse_wu_page() will call the supporting functions
+        # clean_column_labels() and parse_row() as needed.
+        one_day_data = parse_wu_page(source_html)
+
+        # Add a "date" key to each of the dicts within this the list of dicts,
+        # as it currently only includes times.
+        # Then write each dict to the SQL database.
+
+        for hourly_data_dict in one_day_data:
+            hourly_data_dict["Date"] = day_as_string
+            sql_table.insert(hourly_data_dict)
+
+        # Add 1 to the day counter.
+        day_counter += 1
+
+    print("\n\nSuccessfully finished scraping weather data.")
